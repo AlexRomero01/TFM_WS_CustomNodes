@@ -25,7 +25,7 @@ class Calculator(Node):
         self.get_logger().info("Initializing ImageRescaler node")
 
         # Crear archivo de log
-        self.log_file_path = os.path.expanduser("~/sensors_ws/src/custom_nodes/processing_times.txt")
+        self.log_file_path = os.path.expanduser("~/tfm_ws/src/custom_nodes/processing_times.txt")
         self.log_file = open(self.log_file_path, "w")
         self.log_file.write("Process Time Logs:\n")
 
@@ -90,14 +90,14 @@ class Calculator(Node):
                 if self.H is None or self.H.shape[1] != 1280:
                     self.get_logger().info("Loading 1280 homography matrix.")
                     try:
-                        self.H = np.loadtxt(os.path.expanduser("~/sensors_ws/src/custom_nodes/Homography/average_homography2.txt"))
+                        self.H = np.loadtxt(os.path.expanduser("~/tfm_ws/src/custom_nodes/Homography/average_homography2.txt"))
                     except Exception as e:
                         self.get_logger().error(f"Failed to load 1280 homography matrix: {e}")
             elif width == 640:
                 if self.H is None or self.H.shape[1] != 640:
                     self.get_logger().info("Loading 640 homography matrix.")
                     try:
-                        self.H = np.loadtxt(os.path.expanduser("~/sensors_ws/src/custom_nodes/Homography/average_homography_640.txt"))
+                        self.H = np.loadtxt(os.path.expanduser("~/tfm_ws/src/custom_nodes/Homography/average_homography_640.txt"))
                     except Exception as e:
                         self.get_logger().error(f"Failed to load 640 homography matrix: {e}")
             else:

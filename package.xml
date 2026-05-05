@@ -2,11 +2,10 @@
 <package format="3">
   <name>custom_nodes</name>
   <version>0.0.1</version>
-  <description>Custom nodes for thermal and RGB camera integration</description>
+  <description>Custom nodes for multiple sensor integration</description>
   
   <!-- Mantenedores -->
-  <maintainer email="nuria.rodriguez.calderon@upc.edu">Nuria Rodríguez Calderón</maintainer>
-  <maintainer email="yeray@example.com">Yeray Pérez</maintainer>
+  <maintainer email="alex.romero.segues@estudiantat.upc.edu">Àlex Romero Segués</maintainer>
   
   <license>Apache-2.0</license>
 

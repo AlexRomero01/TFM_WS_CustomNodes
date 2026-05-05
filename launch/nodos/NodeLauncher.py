@@ -60,7 +60,7 @@ class NodeLauncher:
             return f"ros2 launch ultralytics_ros tracker.launch.xml yolo_model:={self.options.selected_model_name.get()} classes:={selected_classes}"
 
         elif isinstance(self.options, CalculationOptions):
-            return f"python3 ~/sensors_ws/src/custom_nodes/scripts/temperature_cswi_calculation.py"
+            return f"python3 ~/tfm_ws/src/custom_nodes/scripts/temperature_cswi_calculation.py"
         
         elif isinstance(self.options, NDVIOptions):
             return f"ros2 launch ndvi_sensor ndvi_sensor_v2.launch.py ndvi_process:={self.options.selected_model_name.get()}"

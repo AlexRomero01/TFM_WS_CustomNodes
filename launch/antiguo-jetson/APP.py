@@ -10,7 +10,7 @@ class ROS2App:
         self.root = root
         self.root.title("ROS2 Launcher")
         self.root.geometry("1400x900")
-        root.tk.call("source", "~/sensors_ws/src/custom_nodes/launch/azure.tcl")
+        root.tk.call("source", "~/tfm_ws/src/custom_nodes/launch/azure.tcl")
         root.tk.call("set_theme", "light")
 
         # Define el estilo de botón pequeño

@@ -10,7 +10,7 @@ class GPSCoordinatesOptions(NodeOptions):
     def __init__(self):
         super().__init__(
             package='custom_nodes',
-            executable='~/sensors_ws/src/custom_nodes/scripts/GPS_coordinates_node.py',
+            executable='~/tfm_ws/src/custom_nodes/scripts/GPS_coordinates_node.py',
             node_name='GPS_coordinates_node'
         )
         self.internal_node = True

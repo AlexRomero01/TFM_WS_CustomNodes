@@ -9,7 +9,7 @@ class BiomassOptions(NodeOptions):
     def __init__(self):
         super().__init__(
             package='custom_nodes',
-            executable='~/sensors_ws/src/custom_nodes/scripts/biomass_node.py',
+            executable='~/tfm_ws/src/custom_nodes/scripts/biomass_node.py',
             node_name='biomass_node'
         )
         self.internal_node = True

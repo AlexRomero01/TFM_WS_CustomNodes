@@ -87,7 +87,7 @@ class YOLOOptions(NodeOptions):
             custom_classes = {0: "plant"}
             self.update_class_listbox(custom_classes)
         elif model == "model SYMBIOSYST":
-            self.selected_model_name.set("General_Plants_19_06-seg.pt")
+            self.selected_model_name.set("TFM_NoAugmentation-seg.pt")
             custom_classes = {0: "plant"}
             self.update_class_listbox(custom_classes)
         elif model == "Custom 6":

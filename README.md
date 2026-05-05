@@ -32,7 +32,7 @@ The main launch file (`main_launch.py`) accepts several arguments to customize t
 - `pointcloud_enable`: set to `true` to enable point cloud generation. Default: `false`.
 - `debug`: set to `true` to launch in debug mode. Default: `false`.
 - `focus`: sets the focus of the Optris camera. Default: `70`.
-- `yolo_model`: the YOLO model to be used for object detection. Default: `General_Plants_19_06-seg.pt`.
+- `yolo_model`: the YOLO model to be used for object detection. Default: `TFM_NoAugmentation-seg.pt`.
 - `rgbd_resolution`: the resolution of the RGBD camera. Default: `640,480,30`.
 - `homography_file`: the homography file to be used. Default: `1280`.
 - `name_class`: the name of the class to be detected by YOLO. Default: `plant`.

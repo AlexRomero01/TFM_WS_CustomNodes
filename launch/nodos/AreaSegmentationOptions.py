@@ -9,7 +9,7 @@ class AreaSegmentationOptions(NodeOptions):
     def __init__(self):
         super().__init__(
             package='custom_nodes',
-            executable='~/sensors_ws/src/custom_nodes/scripts/area_segmentation_node.py',
+            executable='~/tfm_ws/src/custom_nodes/scripts/area_segmentation_node.py',
             node_name='area_segment_node'
         )
         self.internal_node = True

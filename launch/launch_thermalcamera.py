@@ -5,8 +5,8 @@ from launch.substitutions import LaunchConfiguration
 
 def generate_launch_description():
     # Obtener las rutas necesarias
-    config_file_path = os.path.expanduser('~/sensors_ws/src/custom_nodes/Homography/config.xml')
-    modify_xml_file_path = os.path.expanduser('~/sensors_ws/src/custom_nodes/scripts/modify_xml.py')
+    config_file_path = os.path.expanduser('~/tfm_ws/src/custom_nodes/Homography/config.xml')
+    modify_xml_file_path = os.path.expanduser('~/tfm_ws/src/custom_nodes/scripts/modify_xml.py')
 
     return LaunchDescription([
         DeclareLaunchArgument('focus', default_value='-1', description='Focus value for the camera'),
