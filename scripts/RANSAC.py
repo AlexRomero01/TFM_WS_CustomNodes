@@ -61,7 +61,18 @@ class RANSACGroundRemoval(Node):
         )
         
         self.bridge = CvBridge()
-        self.camera_info = None
+        
+        # Initialize with hardcoded fallback values
+        self.camera_info = CameraInfo()
+        self.camera_info.header.frame_id = 'camera_depth_optical_frame'
+        self.camera_info.height = 480
+        self.camera_info.width = 640
+        self.camera_info.distortion_model = 'plumb_bob'
+        self.camera_info.d = [0.0, 0.0, 0.0, 0.0, 0.0]
+        self.camera_info.k = [391.92132568359375, 0.0, 323.88165283203125, 0.0, 391.92132568359375, 240.40322875976562, 0.0, 0.0, 1.0]
+        self.camera_info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        self.camera_info.p = [391.92132568359375, 0.0, 323.88165283203125, 0.0, 0.0, 391.92132568359375, 240.40322875976562, 0.0, 0.0, 0.0, 1.0, 0.0]
+        
         self.frame_count = 0
         
         self.get_logger().info(

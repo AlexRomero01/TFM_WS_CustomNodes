@@ -1,7 +1,8 @@
+import json
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, String
 from cv_bridge import CvBridge
 import numpy as np
 import cv2
@@ -34,13 +35,16 @@ class AreaSegmentNode(Node):
         self.depth_subscription = self.create_subscription(
             Image, '/camera/camera/depth/image_rect_raw', self.depth_callback, 10)
 
-        # --- Publicadores ---
+        # --- Publicadores agregados (todos los plantas en conjunto) ---
         self.area_pub       = self.create_publisher(Float32, '/plant/projected_area_cm2',  10)
         self.diag_max_pub   = self.create_publisher(Float32, '/plant/diagonal_max_cm',     10)
         self.diag_min_pub   = self.create_publisher(Float32, '/plant/diagonal_min_cm',     10)
         self.diag_mean_pub  = self.create_publisher(Float32, '/plant/diagonal_mean_cm',    10)
         self.height_max_pub = self.create_publisher(Float32, '/plant/height_max_cm',       10)
         self.height_mean_pub= self.create_publisher(Float32, '/plant/height_mean_cm',      10)
+
+        # --- Publicador por planta individual (JSON String) ---
+        self.per_plant_pub  = self.create_publisher(String, '/plant/geometric_measurements', 10)
 
         self.get_logger().info(
             f"Nodo de Análisis 2D (Convex Hull) Iniciado\n"
@@ -63,12 +67,12 @@ class AreaSegmentNode(Node):
             mask_uint8 = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
 
             with self.depth_lock:
-                if not self.depth_buffer:
-                    return
-                depth_raw = self.depth_buffer[0]
+                depth_raw = self.depth_buffer[0] if self.depth_buffer else None
+
+            has_depth = depth_raw is not None
 
             # 1. Alineación máscara ↔ profundidad
-            if depth_raw.shape != mask_uint8.shape:
+            if has_depth and depth_raw.shape != mask_uint8.shape:
                 depth_raw = cv2.resize(
                     depth_raw,
                     (mask_uint8.shape[1], mask_uint8.shape[0]),
@@ -82,75 +86,154 @@ class AreaSegmentNode(Node):
             if not contours:
                 return
 
+            # ── Aggregate: all plants merged into one Convex Hull ──────────
             all_pts = np.concatenate(contours)
+            hull_all = cv2.convexHull(all_pts)
 
-            # 3. Convex Hull en píxeles
-            hull = cv2.convexHull(all_pts)
+            # Depth-dependent aggregate metrics
+            depth_cm_all = np.array([])
+            if has_depth:
+                mask_pixels = mask_uint8 > 0
+                depth_cm_all = depth_raw[mask_pixels].astype(np.float32) / 10.0
+                depth_cm_all = depth_cm_all[(depth_cm_all >= 100.0) & (depth_cm_all <= 150.0)]
 
-            # 4. Profundidades de los píxeles de la planta (cm)
-            mask_pixels = mask_uint8 > 0
-            depth_cm = depth_raw[mask_pixels].astype(np.float32) / 10.0
+            if not has_depth or depth_cm_all.size == 0:
+                if not has_depth:
+                    self.get_logger().warn("No depth data available; publishing 2D-only measurements.", throttle_duration_sec=5.0)
 
-            # Filtrado por rango (100 cm – 150 cm, igual que el nodo de volumen)
-            depth_cm = depth_cm[(depth_cm >= 100.0) & (depth_cm <= 150.0)]
-            if depth_cm.size == 0:
-                return
-
-            # 5. Alturas (en cámara, "altura" = z_ground – z_pixel)
-            #    Un valor positivo indica que el punto está POR ENCIMA del suelo.
-            heights_cm = self.z_ground - depth_cm   # (N,)
-
-            z_mean = float(np.mean(depth_cm))         # profundidad media para escala
-
-            # Altura media: media de alturas positivas (descarta suelo/fondo)
-            heights_positive = heights_cm[heights_cm > 0]
-            if heights_positive.size > 0:
-                height_mean = float(np.mean(heights_positive))
-                # Altura máxima robusta: percentil configurado de las alturas positivas
-                height_max = float(np.percentile(heights_positive, self._height_pct))
+                # Publish 2D-only aggregate measurements (pixel area in cm² is not meaningful without z, skip)
+                real_area_hull = None
+                diag_max = diag_min = diag_mean = None
+                height_mean = height_max = None
+                z_mean_all = None
             else:
-                height_mean = 0.0
-                height_max  = 0.0
+                heights_all = self.z_ground - depth_cm_all
+                z_mean_all  = float(np.mean(depth_cm_all))
 
-            # 6. Proyección del Hull a coordenadas reales (cm)
-            hull_pts_cm = []
-            for pt in hull:
-                u, v = pt[0]
-                x_cm = (u - self.cx) * z_mean / self.fx
-                y_cm = (v - self.cy) * z_mean / self.fy
-                hull_pts_cm.append([x_cm, y_cm])
+                h_pos_all = heights_all[heights_all > 0]
+                if h_pos_all.size > 0:
+                    height_mean = float(np.mean(h_pos_all))
+                    height_max  = float(np.percentile(h_pos_all, self._height_pct))
+                else:
+                    height_mean = 0.0
+                    height_max  = 0.0
 
-            hull_pts_cm = np.array(hull_pts_cm, dtype=np.float32)
+                hull_pts_cm_all = []
+                for pt in hull_all:
+                    u, v = pt[0]
+                    hull_pts_cm_all.append([
+                        (u - self.cx) * z_mean_all / self.fx,
+                        (v - self.cy) * z_mean_all / self.fy,
+                    ])
+                hull_pts_cm_all = np.array(hull_pts_cm_all, dtype=np.float32)
+                real_area_hull = cv2.contourArea(hull_pts_cm_all)
 
-            # 7. Área del Convex Hull (cm²)
-            real_area_hull = cv2.contourArea(hull_pts_cm)
+                n_verts = len(hull_pts_cm_all)
+                if n_verts >= 2:
+                    idx = np.array(list(combinations(range(n_verts), 2)))
+                    diffs = hull_pts_cm_all[idx[:, 0]] - hull_pts_cm_all[idx[:, 1]]
+                    diag_lengths = np.linalg.norm(diffs, axis=1)
+                    diag_max  = float(diag_lengths.max())
+                    diag_min  = float(diag_lengths.min())
+                    diag_mean = float(diag_lengths.mean())
+                else:
+                    diag_max = diag_min = diag_mean = 0.0
 
-            # 8. Diagonales: todas las distancias entre pares de vértices del hull
-            #    (diagonales reales del polígono, no del bounding box)
-            n_verts = len(hull_pts_cm)
-            if n_verts >= 2:
-                idx = np.array(list(combinations(range(n_verts), 2)))
-                diffs = hull_pts_cm[idx[:, 0]] - hull_pts_cm[idx[:, 1]]
-                diag_lengths = np.linalg.norm(diffs, axis=1)
-                diag_max  = float(diag_lengths.max())
-                diag_min  = float(diag_lengths.min())
-                diag_mean = float(diag_lengths.mean())
-            else:
-                diag_max = diag_min = diag_mean = 0.0
+                # Publicar resultados agregados
+                self.area_pub.publish(       Float32(data=float(real_area_hull)))
+                self.diag_max_pub.publish(   Float32(data=diag_max))
+                self.diag_min_pub.publish(   Float32(data=diag_min))
+                self.diag_mean_pub.publish(  Float32(data=diag_mean))
+                self.height_max_pub.publish( Float32(data=height_max))
+                self.height_mean_pub.publish(Float32(data=height_mean))
 
-            # 9. Publicar resultados
-            self.area_pub.publish(       Float32(data=float(real_area_hull)))
-            self.diag_max_pub.publish(   Float32(data=diag_max))
-            self.diag_min_pub.publish(   Float32(data=diag_min))
-            self.diag_mean_pub.publish(  Float32(data=diag_mean))
-            self.height_max_pub.publish( Float32(data=height_max))
-            self.height_mean_pub.publish(Float32(data=height_mean))
+            # ── Per-plant: process each contour individually ───────────────
+            per_plant_list = []
+            # Sort contours by area (largest first) so IDs are stable frame-to-frame
+            sorted_contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+            for plant_idx, contour in enumerate(sorted_contours):
+                if len(contour) < 3:   # need at least 3 points for a hull
+                    continue
+
+                hull_p = cv2.convexHull(contour)
+
+                # Depth pixels inside this specific plant contour
+                plant_mask = np.zeros_like(mask_uint8)
+                cv2.drawContours(plant_mask, [contour], -1, 255, thickness=cv2.FILLED)
+                plant_pixels = plant_mask > 0
+
+                depth_p = np.array([])
+                if has_depth:
+                    depth_p = depth_raw[plant_pixels].astype(np.float32) / 10.0
+                    depth_p = depth_p[(depth_p >= 100.0) & (depth_p <= 150.0)]
+
+                if depth_p.size > 0:
+                    z_mean_p = float(np.mean(depth_p))
+                    heights_p = self.z_ground - depth_p
+                    h_pos_p   = heights_p[heights_p > 0]
+
+                    if h_pos_p.size > 0:
+                        p_height_mean = float(np.mean(h_pos_p))
+                        p_height_max  = float(np.percentile(h_pos_p, self._height_pct))
+                    else:
+                        p_height_mean = 0.0
+                        p_height_max  = 0.0
+
+                    # Project hull vertices to real-world cm
+                    hull_pts_p = []
+                    for pt in hull_p:
+                        u, v = pt[0]
+                        hull_pts_p.append([
+                            (u - self.cx) * z_mean_p / self.fx,
+                            (v - self.cy) * z_mean_p / self.fy,
+                        ])
+                    hull_pts_p = np.array(hull_pts_p, dtype=np.float32)
+                    p_area = round(float(cv2.contourArea(hull_pts_p)), 2)
+
+                    n_p = len(hull_pts_p)
+                    if n_p >= 2:
+                        idx_p = np.array(list(combinations(range(n_p), 2)))
+                        diffs_p = hull_pts_p[idx_p[:, 0]] - hull_pts_p[idx_p[:, 1]]
+                        dl_p = np.linalg.norm(diffs_p, axis=1)
+                        p_diag_max  = round(float(dl_p.max()), 2)
+                        p_diag_min  = round(float(dl_p.min()), 2)
+                    else:
+                        p_diag_max = p_diag_min = 0.0
+
+                    # Volume proxy (cm³): area_cm2 × height_max_cm
+                    p_volume = round(p_area * p_height_max, 2)
+                else:
+                    # No valid depth data for this plant: use pixel area as fallback
+                    p_area = round(float(cv2.contourArea(hull_p)), 2)  # pixel area (no depth scale)
+                    p_height_mean = p_height_max = None
+                    p_diag_max = p_diag_min = None
+                    p_volume = None
+
+                per_plant_list.append({
+                    "id":             f"Plant_{plant_idx + 1}",
+                    "area_cm2":       p_area,
+                    "diag_max_cm":    p_diag_max,
+                    "diag_min_cm":    p_diag_min,
+                    "height_max_cm":  p_height_max,
+                    "height_mean_cm": p_height_mean,
+                    "volume_cm3":     p_volume,
+                    "depth_available": depth_p.size > 0,
+                })
+
+            if per_plant_list:
+                payload = json.dumps({
+                    "msg_type":   "geometric_measurements",
+                    "plant_count": len(per_plant_list),
+                    "plants":     per_plant_list,
+                })
+                self.per_plant_pub.publish(String(data=payload))
 
             self.get_logger().info(
-                f"Area: {real_area_hull:.1f} cm²  |  "
-                f"Diag max/min/mean: {diag_max:.1f}/{diag_min:.1f}/{diag_mean:.1f} cm  |  "
+                f"[Aggregate] Area: {real_area_hull:.1f} cm²  |  "
+                f"Diag max/min: {diag_max:.1f}/{diag_min:.1f} cm  |  "
                 f"Height max(p{self._height_pct:.0f})/mean: {height_max:.1f}/{height_mean:.1f} cm  |  "
-                f"Z_mean: {z_mean:.1f} cm"
+                f"Plants detected: {len(per_plant_list)}"
             )
 
         except Exception as e:

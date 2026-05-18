@@ -21,7 +21,7 @@ def generate_launch_description():
     pointcloud_enable_launch_arg = DeclareLaunchArgument("pointcloud_enable", default_value='false')
     debug_launch_arg = DeclareLaunchArgument("debug", default_value='false')
     focus_launch_arg = DeclareLaunchArgument("focus", default_value='70')
-    yolo_model_launch_arg = DeclareLaunchArgument("yolo_model", default_value='TFM_NoAugmentation-seg.pt')
+    yolo_model_launch_arg = DeclareLaunchArgument("yolo_model", default_value='TFM_YOLO26_augmentation-seg.pt')
     rgbd_resolution_launch_arg = DeclareLaunchArgument("rgbd_resolution", default_value='640,480,15')
     homography_file_launch_arg = DeclareLaunchArgument("homography_file", default_value='1280')
     name_class_id_launch_arg = DeclareLaunchArgument("name_class", default_value='plant')

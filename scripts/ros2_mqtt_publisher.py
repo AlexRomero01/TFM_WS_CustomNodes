@@ -22,7 +22,7 @@ from sensor_msgs.msg import Temperature, RelativeHumidity
 from geometry_msgs.msg import PointStamped
 
 # Configuraciones
-MQTT_DEFAULT_HOST = "192.168.13.203"  
+MQTT_DEFAULT_HOST = "localhost"  
 MQTT_DEFAULT_PORT = 1883         
 MQTT_DEFAULT_TIMEOUT = 120       
 PUBLISH_RATE_HZ = 2.0 
@@ -45,6 +45,7 @@ ROS2_TOPIC_RELATIVE_HUMIDITY = 'pce_p18/rel_humidity'
 ROS2_TOPIC_ABSOLUTE_HUMIDITY = 'pce_p18/abs_humidity'
 ROS2_TOPIC_DEW_POINT = 'pce_p18/dew_point'
 ROS2_TOPIC_UTM_BASELINK = '/tf_utm_baselink'
+ROS2_TOPIC_GEOMETRIC_MEASUREMENTS = '/plant/geometric_measurements'
 
 MQTT_GLOBAL_TOPIC = "mqtt/global"
 
@@ -55,7 +56,7 @@ class Ros2MqttPublisher(Node):
         # --- MQTT Setup ---
         self.mqtt_host = host
         self.mqtt_port = port
-        self.mqtt_client = mqtt.Client()
+        self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         self.mqtt_client.on_connect = self.on_server_connection
         self.mqtt_client.on_disconnect = self.on_disconnect
         
@@ -68,6 +69,7 @@ class Ros2MqttPublisher(Node):
         self.is_connected = False
         self._last_reconnect_attempt = 0.0
         self.last_data_activity = 0  # Initialize to 0 so the protection logic works
+        self._publish_log_counter = 0
 
         # --- Data Buffers ---
         # Inicializamos a None
@@ -75,7 +77,8 @@ class Ros2MqttPublisher(Node):
             "gps": None, "temperature": None, "ndvi": None, "heading": None,
             "area": None, "location": None, "biomass": None, "light_state": None,
             "crop_type": None, "ambient_temperature": None, "relative_humidity": None,
-            "absolute_humidity": None, "dew_point": None, "tf_position": None
+            "absolute_humidity": None, "dew_point": None, "tf_position": None,
+            "geometric_measurements": None,
         }
 
         self.detected_plants = {} 
@@ -101,12 +104,12 @@ class Ros2MqttPublisher(Node):
         self.subscribe_to_topics()
         self.create_timer(1.0 / PUBLISH_RATE_HZ, self.publish_cycle)
 
-    def on_server_connection(self, client, userdata, flags, rc):
-        if rc == 0:
+    def on_server_connection(self, client, userdata, flags, reason_code, properties=None):
+        if reason_code == 0:
             self.get_logger().info("Connected to MQTT broker.")
             self.is_connected = True
 
-    def on_disconnect(self, client, userdata, rc):
+    def on_disconnect(self, client, userdata, disconnect_flags, reason_code=None, properties=None):
         self.is_connected = False
 
     def subscribe_to_topics(self):
@@ -125,6 +128,7 @@ class Ros2MqttPublisher(Node):
         self.create_subscription(Temperature, ROS2_TOPIC_ABSOLUTE_HUMIDITY, self.absolute_humidity_callback, 10)
         self.create_subscription(Temperature, ROS2_TOPIC_DEW_POINT, self.dew_point_callback, 10)
         self.create_subscription(PointStamped, ROS2_TOPIC_UTM_BASELINK, self.utm_baselink_callback, 10)
+        self.create_subscription(String, ROS2_TOPIC_GEOMETRIC_MEASUREMENTS, self.geometric_measurements_callback, 10)
 
     def ensure_mqtt_connected(self):
         self.last_data_activity = self.get_clock().now().to_msg().sec
@@ -249,6 +253,18 @@ class Ros2MqttPublisher(Node):
         self.latest_data["tf_position"] = {"msg_type": "tf_position", "ts": self.get_msg_time(msg), "x": msg.point.x, "y": msg.point.y, "z": msg.point.z}
         self.ensure_mqtt_connected()
 
+    def geometric_measurements_callback(self, msg: String):
+        """Receive per-plant JSON from area_segmentation_node and store for MQTT publication."""
+        try:
+            data = json.loads(msg.data)
+            # Enrich with timestamp and ensure msg_type is present
+            data["msg_type"] = "geometric_measurements"
+            data["ts"] = self.get_msg_time(msg)
+            self.latest_data["geometric_measurements"] = data
+            self.ensure_mqtt_connected()
+        except Exception as e:
+            self.get_logger().error(f"Error in geometric_measurements_callback: {e}")
+
     def publish_cycle(self):
             # 1. Get current time for the CSV row
             now = self.get_clock().now().to_msg()
@@ -311,11 +327,18 @@ class Ros2MqttPublisher(Node):
 
             # --- MQTT LOGIC (Kept separate/Untouched behavior) ---
             # We only publish via MQTT if there is actually data in the buffers
+            published_any = False
             if self.is_connected:
                 for key, data in self.latest_data.items():
                     if data is not None:
                         payload = json.dumps(data)
                         self.mqtt_client.publish(MQTT_GLOBAL_TOPIC, payload, qos=0)
+                        published_any = True
+                        
+            if published_any:
+                self._publish_log_counter += 1
+                if self._publish_log_counter % 10 == 0:
+                    self.get_logger().info("Actively publishing data to MQTT broker...")
                 
             # IMPORTANT: We no longer set latest_data[key] = None
             # This keeps the CSV full even if a topic doesn't send a message in a specific 0.5s window.
