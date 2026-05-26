@@ -1,4 +1,27 @@
 #!/usr/bin/env python3
+"""
+biomass_node.py
+================
+ROS 2 node that estimates plant biomass (m³) from an RGB-D point cloud
+using a type-specific volumetric heuristic.
+
+For lettuce, the volume is derived from the downsampled surface point count
+via a sphere-packing approximation.  For other crop types a simpler linear
+scaling is used.  The voxel size controls the trade-off between accuracy
+and computation time.
+
+The node also publishes the configured crop type on /crop_type at 1 Hz so
+that downstream nodes (MQTT publisher, CSV logger) can log it.
+
+Subscriptions:
+    /camera/camera/color/image_raw          sensor_msgs/Image
+    /camera/camera/depth/image_rect_raw     sensor_msgs/Image
+    /camera/camera/depth/camera_info        sensor_msgs/CameraInfo
+
+Publications:
+    /plant_biomass   std_msgs/Float32   (volumetric estimate in m³)
+    /crop_type       std_msgs/String    (configured plant type, 1 Hz)
+"""
 import rclpy
 import numpy as np
 import open3d as o3d
@@ -10,19 +33,19 @@ import os
 import csv
 from datetime import datetime
 
-VOXEL_SIZE = 0.01  # m
-PRINT_VOLUME = True
-SAVE_DATA = False
-VISUALIZE = False
+VOXEL_SIZE   = 0.01   # voxel side length in metres
+PRINT_VOLUME = True   # log estimated volume to console
+SAVE_DATA    = False  # save point clouds and CSV to disk
+VISUALIZE   = False  # open Open3D viewer (blocks until closed)
 
 
 class BiomassNode(Node):
     def __init__(self):
         super().__init__('biomass_node')
 
-        # --- Configura el tipo de cultivo aquí ---
-        self.plant_type = "lettuce"  # <- Cambia a "other_crop" si quieres
-        self.get_logger().info(f"Plant type fixed internally as: {self.plant_type}")
+        # Plant type — change to 'other_crop' or any other string to use the generic heuristic
+        self.plant_type = "lettuce"
+        self.get_logger().info(f"Plant type: {self.plant_type}")
 
         self.count = 0
         self.name = "plant"

@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
+"""
+utm_base_link_xy.py
+====================
+ROS 2 node that reads the UTM → base_link TF transform at 1 Hz and
+publishes the robot's UTM (x, y, z) position as a PointStamped message.
 
+This provides a convenient metric position topic for the MQTT publisher
+and CSV logger without requiring consumers to query the TF tree directly.
+
+Publications:
+    /tf_utm_baselink   geometry_msgs/PointStamped  (UTM frame, 1 Hz)
+"""
 import rclpy
 from rclpy.node import Node
 from tf2_ros import TransformListener, Buffer

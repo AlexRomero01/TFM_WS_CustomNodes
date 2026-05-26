@@ -32,6 +32,7 @@ Pre-processing (shared, applied before both methods):
 
 Subscriptions:
     - /camera/camera/color/image_raw  (sensor_msgs/Image)
+    - /gps/fix                        (sensor_msgs/NavSatFix)   [GPS gate]
 
 Publications (ExG method):
     - /perception/exg/mask            sensor_msgs/Image  (mono8)
@@ -62,19 +63,26 @@ Parameters
   hsv_hue_high        int    Upper Hue bound in OpenCV units [0,179]    (85)
   hsv_sat_min         int    Minimum Saturation to reject grey/soil     (40)
 
+  --- GPS gate ---
+  gps_topic           str    NavSatFix input topic                (/gps/fix)
+  camera_fov_length   float  Min. displacement between segmentations [m]  (2.66)
+  gps_gate_enabled    bool   Enable GPS-distance gate             (True)
+
 Author: Àlex Romero Segués  –  custom_nodes package
 """
 
+import math
 import time
 from typing import Optional
 
 import cv2
 import numpy as np
 import rclpy
+import utm
 from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, NavSatFix
 from std_msgs.msg import Float32
 
 
@@ -120,6 +128,10 @@ class ClassicalRgbSegmentationNode(Node):
         self.declare_parameter('hsv_hue_low',       35)
         self.declare_parameter('hsv_hue_high',      85)
         self.declare_parameter('hsv_sat_min',       40)
+        # GPS gate
+        self.declare_parameter('gps_topic',         '/gps/fix')
+        self.declare_parameter('camera_fov_length', 2.66)   # metres — Camera FoV Length
+        self.declare_parameter('gps_gate_enabled',  True)
 
         # ── Read parameters ───────────────────────────────────────────────
         rgb_topic         = self.get_parameter('rgb_topic').value
@@ -134,9 +146,12 @@ class ClassicalRgbSegmentationNode(Node):
         sync_slop         = float(self.get_parameter('sync_slop').value)
         self._depth_min   = float(self.get_parameter('depth_min_m').value)  # metres
         self._depth_max   = float(self.get_parameter('depth_max_m').value)  # metres
-        self._hue_low     = int(self.get_parameter('hsv_hue_low').value)
-        self._hue_high    = int(self.get_parameter('hsv_hue_high').value)
-        self._sat_min     = int(self.get_parameter('hsv_sat_min').value)
+        self._hue_low      = int(self.get_parameter('hsv_hue_low').value)
+        self._hue_high     = int(self.get_parameter('hsv_hue_high').value)
+        self._sat_min      = int(self.get_parameter('hsv_sat_min').value)
+        gps_topic          = str(self.get_parameter('gps_topic').value)
+        self._fov_length   = float(self.get_parameter('camera_fov_length').value)
+        self._gps_gate_enabled = bool(self.get_parameter('gps_gate_enabled').value)
 
         if self._method not in ('exg', 'hsv', 'both'):
             self.get_logger().warn(
@@ -172,6 +187,22 @@ class ClassicalRgbSegmentationNode(Node):
 
         # ── cv_bridge ────────────────────────────────────────────────────
         self._bridge = CvBridge()
+
+        # ── GPS gate state ────────────────────────────────────────────────
+        # _ref_easting / _ref_northing : UTM position (E₀, N₀) at the moment
+        # of the last accepted segmentation.  Updated every time the gate
+        # lets a frame through → works correctly on second passes.
+        self._latest_gps:         Optional[NavSatFix] = None
+        self._ref_easting:        Optional[float]     = None   # E₀ (m)
+        self._ref_northing:       Optional[float]     = None   # N₀ (m)
+        self._last_displacement_m: float              = 0.0    # Δd_RTK last check
+        self._gps_skipped_frames:  int                = 0
+        self._gps_processed_frames: int               = 0
+
+        # ── GPS subscriber (independent of RGB/Depth sync) ─────────────────
+        if self._gps_gate_enabled:
+            self.create_subscription(
+                NavSatFix, gps_topic, self._gps_callback, queue_size)
 
         # ── Subscribers (synchronized RGB + Depth) ───────────────────────
         # Store the latest valid depth mask so RGB frames never block waiting.
@@ -213,6 +244,10 @@ class ClassicalRgbSegmentationNode(Node):
             f"GaussianBlur {self._blur_ksize[0]}×{self._blur_ksize[1]}"
             if self._blur_enabled else "disabled (kernel=1)"
         )
+        _gate_label = (
+            f"ENABLED  (FoV={self._fov_length:.2f} m, topic={gps_topic})"
+            if self._gps_gate_enabled else "DISABLED"
+        )
         self.get_logger().info(
             "ClassicalRgbSegmentationNode started\n"
             f"  rgb_topic         : {rgb_topic}\n"
@@ -226,6 +261,7 @@ class ClassicalRgbSegmentationNode(Node):
             f"  HSV range Hue     : [{self._hue_low}, {self._hue_high}]\n"
             f"  HSV sat_min       : {self._sat_min}\n"
             f"  sync_slop         : {sync_slop} s\n"
+            f"  GPS gate          : {_gate_label}\n"
             "  Topics (ExG) : /perception/exg/mask  /perception/exg/overlay  "
             "/perception/exg/latency_ms\n"
             "  Topics (HSV) : /perception/hsv/mask  /perception/hsv/overlay  "
@@ -257,6 +293,13 @@ class ClassicalRgbSegmentationNode(Node):
             lines.append(f"  ExG latency (ms) : {self._latency_stats(self._exg_latency_buf)}")
         if self._method in ('hsv', 'both'):
             lines.append(f"  HSV latency (ms) : {self._latency_stats(self._hsv_latency_buf)}")
+        if self._gps_gate_enabled:
+            lines.append(
+                f"  GPS gate          : Δd={self._last_displacement_m:.2f} m"
+                f" / {self._fov_length:.2f} m"
+                f"  |  processed={self._gps_processed_frames}"
+                f"  skipped={self._gps_skipped_frames}"
+            )
         lines.append("  → rqt_plot /perception/exg/latency_ms/data /perception/hsv/latency_ms/data")
         self.get_logger().info("\n".join(lines))
 
@@ -314,6 +357,12 @@ class ClassicalRgbSegmentationNode(Node):
 
         stamp = rgb_msg.header.stamp
         frame = rgb_msg.header.frame_id
+
+        # ── GPS gate — skip frame if robot hasn't moved enough ────────────
+        if self._gps_gate_enabled and not self._should_process_frame():
+            self._gps_skipped_frames += 1
+            return
+        self._gps_processed_frames += 1
 
         if self._method in ('exg', 'both'):
             try:
@@ -490,6 +539,102 @@ class ClassicalRgbSegmentationNode(Node):
         buf.append(latency_ms)
         if len(buf) > self._BUF_SIZE:
             buf.pop(0)
+
+
+    # ──────────────────────────────────────── GPS gate methods ─────────────
+
+    def _gps_callback(self, msg: NavSatFix) -> None:
+        """Store the latest GPS fix. Called independently of the image sync."""
+        self._latest_gps = msg
+
+    @staticmethod
+    def _latlon_to_utm(lat: float, lon: float) -> tuple[float, float]:
+        """
+        Convert (lat, lon) degrees → UTM (easting, northing) in metres.
+        Uses the `utm` library for full WGS-84 accuracy.
+        Returns (easting, northing).
+        """
+        easting, northing, _zone_num, _zone_let = utm.from_latlon(lat, lon)
+        return easting, northing
+
+    def _should_process_frame(self) -> bool:
+        """
+        GPS gate decision.
+
+        Returns True  → process the frame AND update the UTM reference.
+        Returns False → skip (Δd_RTK < Camera_FoV_Length).
+
+        Fail-safe rules (always return True and warn):
+          1. No NavSatFix message received yet on /gps/fix.
+          2. NavSatFix.status.status < 0  (STATUS_NO_FIX).
+          3. utm conversion raises an exception.
+
+        Reference update strategy (rolling):
+          Every time a frame is accepted the reference (E₀, N₀) is updated
+          to the current UTM position.  This means the gate works correctly
+          on second passes: the robot must move ≥ FoV_Length from its
+          *last segmented position*, regardless of which pass it is on.
+        """
+        gps = self._latest_gps
+
+        # ── Fail-safe 1: no GPS message received at all ───────────────────
+        if gps is None:
+            if self._frame_count % 100 == 1:
+                self.get_logger().warn(
+                    "GPS gate: no message on /gps/fix yet — segmenting anyway (fail-safe). "
+                    "Check: ros2 topic hz /gps/fix"
+                )
+            return True
+
+        # ── Fail-safe 2: fix not valid (STATUS_NO_FIX = -1) ──────────────
+        if gps.status.status < 0:
+            if self._frame_count % 100 == 1:
+                self.get_logger().warn(
+                    f"GPS gate: NavSatFix status={gps.status.status} (NO_FIX) — "
+                    "segmenting anyway (fail-safe)."
+                )
+            return True
+
+        # ── Convert current position to UTM ───────────────────────────────
+        try:
+            cur_e, cur_n = self._latlon_to_utm(gps.latitude, gps.longitude)
+        except Exception as exc:
+            self.get_logger().error(
+                f"GPS gate: utm conversion failed ({exc}) — segmenting anyway (fail-safe)."
+            )
+            return True
+
+        # ── First frame / no reference yet ────────────────────────────────
+        if self._ref_easting is None or self._ref_northing is None:
+            self._ref_easting  = cur_e
+            self._ref_northing = cur_n
+            self._last_displacement_m = 0.0
+            self.get_logger().info(
+                f"GPS gate: reference set → E={cur_e:.2f} m  N={cur_n:.2f} m "
+                f"(lat={gps.latitude:.7f}, lon={gps.longitude:.7f})"
+            )
+            return True
+
+        # ── Compute Δd_RTK = sqrt((E_t-E_0)^2 + (N_t-N_0)^2) ─────────────
+        dE = cur_e - self._ref_easting
+        dN = cur_n - self._ref_northing
+        delta_d = math.sqrt(dE * dE + dN * dN)
+        self._last_displacement_m = delta_d
+
+        # ── Gate decision ─────────────────────────────────────────────────
+        if delta_d < self._fov_length:
+            self.get_logger().debug(
+                f"GPS gate: Δd={delta_d:.3f} m < FoV={self._fov_length:.2f} m — skipped."
+            )
+            return False
+
+        # ── Sufficient displacement — update rolling reference ─────────────
+        self.get_logger().debug(
+            f"GPS gate: Δd={delta_d:.3f} m ≥ FoV={self._fov_length:.2f} m — processing."
+        )
+        self._ref_easting  = cur_e
+        self._ref_northing = cur_n
+        return True
 
 
 # ---------------------------------------------------------------------------

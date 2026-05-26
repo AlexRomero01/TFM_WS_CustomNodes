@@ -53,15 +53,19 @@ RViz2 setup
 Author: Àlex Romero Segués  –  custom_nodes package
 """
 import struct
+import math
+import threading
+from collections import deque
+from typing import Optional
 
 import rclpy
 import numpy as np
+import utm
 from rclpy.node import Node
-from sensor_msgs.msg import Image, CameraInfo, PointCloud2, PointField
+from sensor_msgs.msg import Image, PointCloud2, PointField, NavSatFix
 from std_msgs.msg import Float32, Float32MultiArray
 from visualization_msgs.msg import Marker, MarkerArray
 from cv_bridge import CvBridge
-from message_filters import ApproximateTimeSynchronizer, Subscriber
 from builtin_interfaces.msg import Duration
 
 # ---------------------------------------------------------------------------
@@ -119,15 +123,15 @@ class VolumeEstimationNode(Node):
         # ------------------------------------------------------------------
         self.declare_parameter('depth_topic',        '/camera/camera/depth/image_rect_raw')
         self.declare_parameter('mask_topic',         '/Temperature_and_CSWI/rescaled_yolo_masks')
-        self.declare_parameter('camera_info_topic',  '/camera/camera/depth/camera_info')
+        self.declare_parameter('gps_topic',          '/gps/fix')
+        self.declare_parameter('camera_fov_length',  1.55)   # metres — Camera FoV Length
+        self.declare_parameter('gps_gate_enabled',   True)
         self.declare_parameter('ransac_topic',       '/ransac_plane')
         self.declare_parameter('voxel_resolution',           0.03)   # metres  (3cm = 27x fewer voxels than 1cm)
         self.declare_parameter('min_depth_m',                1.0)    # metres  – near depth cut-off  (100 cm)
         self.declare_parameter('max_depth_m',                1.5)    # metres  – far  depth cut-off  (150 cm)
         self.declare_parameter('max_height_above_ground_m',  5.0)    # metres - set large to disable cap (debug)
         self.declare_parameter('max_fill_voxels',            100)    # voxels per column (safety cap)
-        self.declare_parameter('sync_queue_size',            30)
-        self.declare_parameter('sync_slop',                  1.0)    # seconds
         self.declare_parameter('marker_frame_id',            'volume_frame')
         self.declare_parameter('marker_lifetime_s',          0.5)    # seconds
         self.declare_parameter('process_every_nth_frame',    3)      # publish every 3rd sync (~3 Hz output)
@@ -139,15 +143,15 @@ class VolumeEstimationNode(Node):
         # ------------------------------------------------------------------
         depth_topic       = self.get_parameter('depth_topic').value
         mask_topic        = self.get_parameter('mask_topic').value
-        cam_info_topic    = self.get_parameter('camera_info_topic').value
+        gps_topic         = self.get_parameter('gps_topic').value
+        self._fov_length  = float(self.get_parameter('camera_fov_length').value)
+        self._gps_gate_enabled = bool(self.get_parameter('gps_gate_enabled').value)
         ransac_topic      = self.get_parameter('ransac_topic').value
         self.voxel_res        = float(self.get_parameter('voxel_resolution').value)
         self.min_depth        = float(self.get_parameter('min_depth_m').value)
         self.max_depth        = float(self.get_parameter('max_depth_m').value)
         self._max_height      = float(self.get_parameter('max_height_above_ground_m').value)
         self._max_fill_vox    = int(self.get_parameter('max_fill_voxels').value)
-        queue_size            = int(self.get_parameter('sync_queue_size').value)
-        slop                  = float(self.get_parameter('sync_slop').value)
         self.marker_frame     = self.get_parameter('marker_frame_id').value
         marker_life           = float(self.get_parameter('marker_lifetime_s').value)
         self._nth_frame       = int(self.get_parameter('process_every_nth_frame').value)
@@ -165,27 +169,38 @@ class VolumeEstimationNode(Node):
         self.bridge = CvBridge()
 
         # ------------------------------------------------------------------
+        # RealSense D457 intrinsics (fx, fy, cx, cy)
+        # ------------------------------------------------------------------
+        self.fx = 391.92132568359375
+        self.fy = 391.92132568359375
+        self.cx = 323.88165283203125
+        self.cy = 240.40322875976562
+
+        # ------------------------------------------------------------------
+        # GPS gate state
+        # ------------------------------------------------------------------
+        self._latest_gps:         Optional[NavSatFix] = None
+        self._ref_easting:        Optional[float]     = None
+        self._ref_northing:       Optional[float]     = None
+        self._last_displacement_m: float              = 0.0
+        self._gps_skipped:  int = 0
+        self._gps_accepted: int = 0
+        self._mask_frame_count: int = 0
+
+        # ------------------------------------------------------------------
         # Subscribers
         # ------------------------------------------------------------------
-        # Depth + CameraInfo come from the same rosbag → synchronize them.
-        # YOLO mask is produced by a live processing node with its own clock
-        # domain → do NOT put it in the synchronizer.  Store the latest mask
-        # as self._latest_mask and use it whenever the depth sync fires.
-        # ------------------------------------------------------------------
-        self._latest_mask: np.ndarray | None = None  # latest YOLO mask image
+        if self._gps_gate_enabled:
+            self.create_subscription(
+                NavSatFix, gps_topic, self._gps_callback, 10)
 
         self._sub_mask = self.create_subscription(
             Image, mask_topic, self._mask_callback, 10)
 
-        self._sub_depth = Subscriber(self, Image, depth_topic)
-        self._sub_info  = Subscriber(self, CameraInfo, cam_info_topic)
-
-        self._sync = ApproximateTimeSynchronizer(
-            [self._sub_depth, self._sub_info],
-            queue_size=queue_size,
-            slop=slop,
-        )
-        self._sync.registerCallback(self._synced_callback)
+        self.depth_buffer = deque(maxlen=1)
+        self.depth_lock = threading.Lock()
+        self._sub_depth = self.create_subscription(
+            Image, depth_topic, self._depth_callback, 10)
 
         # RANSAC plane – separate subscription (updated whenever available)
         self._ransac_plane: np.ndarray | None = None  # [a, b, c, d]
@@ -216,11 +231,15 @@ class VolumeEstimationNode(Node):
         # synchronizer is firing or the node is silently idle.
         self._heartbeat = self.create_timer(10.0, self._heartbeat_cb)
 
+        gate_label = (
+            f"ENABLED  (FoV={self._fov_length:.2f} m, topic={gps_topic})"
+            if self._gps_gate_enabled else "DISABLED"
+        )
         self.get_logger().info(
             f"VolumeEstimationNode started\n"
             f"  depth_topic             : {depth_topic}\n"
             f"  mask_topic              : {mask_topic}\n"
-            f"  camera_info_topic       : {cam_info_topic}\n"
+            f"  GPS gate                : {gate_label}\n"
             f"  ransac_topic            : {ransac_topic}\n"
             f"  voxel_resolution        : {self.voxel_res} m\n"
             f"  max_height_above_ground : {self._max_height} m\n"
@@ -229,38 +248,147 @@ class VolumeEstimationNode(Node):
             f"  process_every_nth_frame : {self._nth_frame}\n"
             f"  max_cloud_points        : {self._max_cloud_pts}\n"
             f"  publish_markers         : {self._pub_markers_en}\n"
-            f"  sync_slop               : {slop} s\n"
             f"  frame_id                : {self.marker_frame}\n"
             f"  → Cloud published in {self.marker_frame} (raw camera frame)\n"
             f"    RViz2: Fixed Frame={self.marker_frame}, Invert Z Axis=true, Color=RGB8"
         )
 
+    # --------------------------------------------------- Depth callback
+    def _depth_callback(self, msg: Image):
+        try:
+            depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='16UC1')
+            with self.depth_lock:
+                self.depth_buffer.append((depth_image, msg.header.stamp))
+        except Exception as e:
+            self.get_logger().error(f"Error in depth_callback: {e}")
+
+    # --------------------------------------------------- GPS logic
+    def _gps_callback(self, msg: NavSatFix) -> None:
+        """Stores the latest GPS fix."""
+        self._latest_gps = msg
+
+    @staticmethod
+    def _latlon_to_utm(lat: float, lon: float) -> tuple[float, float]:
+        """Converts (lat, lon) degrees → UTM (easting, northing) in metres."""
+        easting, northing, _zone_num, _zone_let = utm.from_latlon(lat, lon)
+        return easting, northing
+
+    def _should_process_frame(self) -> bool:
+        """
+        GPS gate decision.
+
+        Returns True  → process the frame AND update the UTM reference.
+        Returns False → skip the frame (Δd_RTK < Camera_FoV_Length).
+
+        Fail-safes (always return True + warn):
+          1. No NavSatFix received on /gps/fix.
+          2. NavSatFix.status.status < 0 (STATUS_NO_FIX).
+          3. UTM conversion fails.
+        """
+        gps = self._latest_gps
+
+        if gps is None:
+            if self._mask_frame_count % 100 == 1:
+                self.get_logger().warn(
+                    "GPS gate: no message on /gps/fix — segmenting anyway (fail-safe). "
+                    "Check: ros2 topic hz /gps/fix"
+                )
+            return True
+
+        if gps.status.status < 0:
+            if self._mask_frame_count % 100 == 1:
+                self.get_logger().warn(
+                    f"GPS gate: NavSatFix status={gps.status.status} (NO_FIX) — "
+                    "segmenting anyway (fail-safe)."
+                )
+            return True
+
+        try:
+            cur_e, cur_n = self._latlon_to_utm(gps.latitude, gps.longitude)
+        except Exception as exc:
+            self.get_logger().error(
+                f"GPS gate: UTM conversion failed ({exc}) — segmenting anyway (fail-safe)."
+            )
+            return True
+
+        if self._ref_easting is None or self._ref_northing is None:
+            self._ref_easting  = cur_e
+            self._ref_northing = cur_n
+            self._last_displacement_m = 0.0
+            self.get_logger().info(
+                f"GPS gate: initial reference → E={cur_e:.2f} m  N={cur_n:.2f} m "
+                f"(lat={gps.latitude:.7f}, lon={gps.longitude:.7f})"
+            )
+            return True
+
+        dE = cur_e - self._ref_easting
+        dN = cur_n - self._ref_northing
+        delta_d = math.sqrt(dE * dE + dN * dN)
+        self._last_displacement_m = delta_d
+
+        if delta_d < self._fov_length:
+            self.get_logger().debug(
+                f"GPS gate: Δd={delta_d:.3f} m < FoV={self._fov_length:.2f} m — frame skipped."
+            )
+            return False
+
+        self.get_logger().debug(
+            f"GPS gate: Δd={delta_d:.3f} m >= FoV={self._fov_length:.2f} m — processing."
+        )
+        self._ref_easting  = cur_e
+        self._ref_northing = cur_n
+        return True
+
     # --------------------------------------------------- Mask callback
     def _mask_callback(self, msg: Image):
-        """Store the latest YOLO mask.  Not time-synchronized with depth."""
+        """Processes depth and mask when a new mask arrives, subject to GPS gating."""
+        self._mask_frame_count += 1
+        
+        # Frame-skip: only process every Nth frame to reduce CPU + RViz load
+        if (self._mask_frame_count % self._nth_frame) != 0:
+            return
+
+        if self._gps_gate_enabled and not self._should_process_frame():
+            self._gps_skipped += 1
+            if self._mask_frame_count % 50 == 0:
+                self.get_logger().info(
+                    f"[GPS gate] Δd={self._last_displacement_m:.2f} m / {self._fov_length:.2f} m"
+                    f" | accepted={self._gps_accepted}  skipped={self._gps_skipped}"
+                )
+            return
+        
+        self._gps_accepted += 1
+        self._frame_count += 1
+
         try:
-            raw = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-            self._latest_mask = raw
+            mask_raw = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+            
+            with self.depth_lock:
+                depth_data = self.depth_buffer[0] if self.depth_buffer else None
+                
+            if depth_data is None:
+                if self._frame_count % 30 == 0:
+                    self.get_logger().warn("No depth data available yet - skipping frame.")
+                return
+                
+            depth_raw, stamp = depth_data
+            self._process(depth_raw, mask_raw, stamp)
+
         except Exception as exc:
-            self.get_logger().error(f"Mask decode error: {exc}")
+            self.get_logger().error(f"Mask/Processing error (frame {self._frame_count}): {exc}")
 
     # --------------------------------------------------- Heartbeat timer
     def _heartbeat_cb(self):
-        """Fires every 10 s so it is clear whether the synchronizer is working."""
-        mask_ok = self._latest_mask is not None
+        """Fires every 10 s so it is clear whether the node is working."""
         self.get_logger().info(
             f"[heartbeat] frames_processed={self._frame_count} | "
             f"ransac_msgs={self._ransac_plane_count} | "
-            f"mask_received={mask_ok}"
+            f"gps_accepted={self._gps_accepted} | gps_skipped={self._gps_skipped}"
         )
         if self._frame_count == 0:
             self.get_logger().warn(
-                "  No synchronized frames yet!\n"
-                "  Sync only needs depth + camera_info (same rosbag).\n"
-                "  Possible causes:\n"
-                "  1. Depth or CameraInfo topic not publishing\n"
-                "  2. sync_slop too tight (current=1.0s):\n"
-                "     ros2 param set /volume_estimation_node sync_slop 5.0"
+                "  No frames processed yet!\n"
+                "  Check if depth and mask topics are publishing."
             )
 
     # --------------------------------------------------- RANSAC callback
@@ -282,33 +410,14 @@ class VolumeEstimationNode(Node):
                 f"RANSAC message has {len(msg.data)} values; expected 4 [a,b,c,d]."
             )
 
-    # --------------------------------------------------- Synced callback
-    def _synced_callback(
-        self,
-        depth_msg: Image,
-        info_msg:  CameraInfo,
-    ):
-        """Fires when depth + camera_info are synchronized."""
-        self._frame_count += 1
-        # Frame-skip: only process every Nth frame to reduce CPU + RViz load
-        if (self._frame_count % self._nth_frame) != 0:
-            return
-        
-        self.get_logger().debug(
-            f"Sync fired! frame={self._frame_count} "
-            f"stamp={depth_msg.header.stamp.sec}.{depth_msg.header.stamp.nanosec:09d} "
-            f"mask_ready={self._latest_mask is not None}"
-        )
-        try:
-            self._process(depth_msg, info_msg)
-        except Exception as exc:
-            self.get_logger().error(f"Processing error (frame {self._frame_count}): {exc}")
+    # Removed _synced_callback as we are no longer using ApproximateTimeSynchronizer.
 
     # --------------------------------------------------- Core processing
     def _process(
         self,
-        depth_msg: Image,
-        info_msg:  CameraInfo,
+        depth_raw: np.ndarray,
+        mask_img:  np.ndarray,
+        stamp,
     ):
         """
         Volume estimation pipeline:
@@ -320,11 +429,9 @@ class VolumeEstimationNode(Node):
           5. Publish filled voxel cloud in GREEN on /volume/point_cloud.
         """
         # -- 1. Image decoding -----------------------------------------------
-        depth_raw = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
-        depth_m   = depth_raw.astype(np.float32) / 1000.0      # mm -> m
+        depth_m = depth_raw.astype(np.float32) / 1000.0      # mm -> m
 
-        if self._latest_mask is not None:
-            mask_img = self._latest_mask
+        if mask_img is not None:
             fg_mask  = (np.any(mask_img > 0, axis=2)
                         if mask_img.ndim == 3 else mask_img > 0)
             # Resize mask to depth dimensions if they differ
@@ -337,14 +444,11 @@ class VolumeEstimationNode(Node):
                 ).astype(bool)
         else:
             # No mask yet - process the full depth image
-            if self._frame_count % 30 == 0:
-                self.get_logger().warn("No YOLO mask yet - using full depth image.")
             fg_mask = np.ones(depth_m.shape, dtype=bool)
 
         # ── 2. Camera intrinsics ─────────────────────────────────────────
-        K  = info_msg.k
-        fx = K[0];  cx = K[2]
-        fy = K[4];  cy = K[5]
+        fx = self.fx; cx = self.cx
+        fy = self.fy; cy = self.cy
 
         # ── 3. Back-project YOLO-masked pixels to 3D (vectorised) ────────
         # Only pixels inside the YOLO segmentation mask are used.
@@ -391,8 +495,6 @@ class VolumeEstimationNode(Node):
                 f"voxels: {voxel_count:,} | "
                 f"vol: {volume_m3*1e6:.1f} cm³"
             )
-
-        stamp = depth_msg.header.stamp
 
         vol_msg = Float32()
         vol_msg.data = float(volume_m3)

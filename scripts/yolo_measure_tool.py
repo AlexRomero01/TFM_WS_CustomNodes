@@ -69,12 +69,14 @@ def _sample_depth_cm(depth_raw: np.ndarray, u: int, v: int) -> float:
     return float(np.median(valid)) / 10.0   # mm → cm
 
 
+SPATIAL_CALIB_FACTOR = 0.9765
+
 def _project_pixel(u: int, v: int, z_cm: float,
                    fx: float, fy: float, cx: float, cy: float
                    ) -> np.ndarray:
     """Back-project pixel (u,v) + depth z_cm → 3-D camera-frame point in cm."""
-    x = (u - cx) * z_cm / fx
-    y = (v - cy) * z_cm / fy
+    x = ((u - cx) * z_cm / fx) * SPATIAL_CALIB_FACTOR
+    y = ((v - cy) * z_cm / fy) * SPATIAL_CALIB_FACTOR
     return np.array([x, y, z_cm], dtype=np.float64)
 
 
@@ -108,10 +110,10 @@ class YoloMeasureNode(Node):
     """Subscribes to /yolo_image and depth; hosts interactive measurement UI."""
 
     # ── RealSense D457 intrinsics (from camera/camera/color/camera_info) ──────
-    FX = 385.0450439453125
-    FY = 384.5845642089844
-    CX = 325.48455810546875
-    CY = 241.35191345214844
+    FX = 391.92132568359375
+    FY = 391.92132568359375
+    CX = 323.88165283203125
+    CY = 240.40322875976562
 
     def __init__(self):
         super().__init__('yolo_measure_tool')
@@ -137,7 +139,7 @@ class YoloMeasureNode(Node):
 
         # ── Subscriptions ─────────────────────────────────────────────────────
         self.create_subscription(
-            Image, '/yolo_image', self._yolo_cb, 10)
+            Image, '/camera/camera/color/image_raw', self._yolo_cb, 10)
         self.create_subscription(
             Image, '/camera/camera/depth/image_rect_raw', self._depth_cb, 10)
 

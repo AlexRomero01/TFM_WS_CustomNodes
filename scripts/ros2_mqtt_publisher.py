@@ -1,11 +1,35 @@
 #!/usr/bin/env python3
 """
-ROS2 MQTT Publisher Node
-========================
-Publishes sensor data to MQTT broker in real-time at 2 messages/second.
-CSV logging is handled separately by csv_safecopy.py
-"""
+ros2_mqtt_publisher.py
+======================
+ROS 2 node that aggregates data from all robot sensors and forwards it to
+the MQTT broker in two ways:
 
+  - CSV (2 Hz timer)   : fixed-rate snapshot written to a local CSV file.
+  - MQTT (event-driven): one message per FOV analysis event, triggered by
+    the geometric_measurements topic from area_segmentation_node
+    (i.e. approximately every 1.55 m of robot travel).
+
+Subscriptions:
+    gps/fix                               sensor_msgs/NavSatFix
+    /Temperature_and_CSWI/text            std_msgs/String
+    /NDVI                                 std_msgs/String
+    /ublox_rover/navheading               sensor_msgs/Imu
+    /segmentation_area_info               std_msgs/Float32
+    /navigation/information               std_msgs/String
+    /plant_biomass                        std_msgs/Float32
+    /crop_light_state                     std_msgs/String
+    /crop_type                            std_msgs/String
+    pce_p18/temperature                   sensor_msgs/Temperature
+    pce_p18/rel_humidity                  sensor_msgs/RelativeHumidity
+    pce_p18/abs_humidity                  sensor_msgs/Temperature
+    pce_p18/dew_point                     sensor_msgs/Temperature
+    /tf_utm_baselink                      geometry_msgs/PointStamped
+    /plant/geometric_measurements         std_msgs/String  (JSON)
+
+Publications (MQTT topic: mqtt/global):
+    fov_snapshot JSON — full sensor state at each FOV event
+"""
 import re
 import json
 import math
@@ -21,11 +45,11 @@ from std_msgs.msg import String, Float32
 from sensor_msgs.msg import Temperature, RelativeHumidity
 from geometry_msgs.msg import PointStamped
 
-# Configuraciones
+# Configurations
 MQTT_DEFAULT_HOST = "localhost"  
 MQTT_DEFAULT_PORT = 1883         
 MQTT_DEFAULT_TIMEOUT = 120       
-PUBLISH_RATE_HZ = 2.0 
+CSV_RATE_HZ = 2.0       # CSV-only timer rate
 
 NO_DATA_TIMEOUT = 10.0
 RECONNECT_ATTEMPT_INTERVAL = 5.0
@@ -72,7 +96,7 @@ class Ros2MqttPublisher(Node):
         self._publish_log_counter = 0
 
         # --- Data Buffers ---
-        # Inicializamos a None
+        # Initialize to None
         self.latest_data = {
             "gps": None, "temperature": None, "ndvi": None, "heading": None,
             "area": None, "location": None, "biomass": None, "light_state": None,
@@ -102,7 +126,8 @@ class Ros2MqttPublisher(Node):
             csv.DictWriter(f, fieldnames=self.csv_fields).writeheader()
 
         self.subscribe_to_topics()
-        self.create_timer(1.0 / PUBLISH_RATE_HZ, self.publish_cycle)
+        # CSV logger fires at CSV_RATE_HZ; MQTT upload is event-driven (see publish_fov_snapshot)
+        self.create_timer(1.0 / CSV_RATE_HZ, self.publish_cycle)
 
     def on_server_connection(self, client, userdata, flags, reason_code, properties=None):
         if reason_code == 0:
@@ -132,20 +157,20 @@ class Ros2MqttPublisher(Node):
 
     def ensure_mqtt_connected(self):
         self.last_data_activity = self.get_clock().now().to_msg().sec
-        # Lógica de reconexión simplificada para brevedad
+        # Simplified reconnection logic for brevity
         if not self.is_connected and (self.last_data_activity - self._last_reconnect_attempt > RECONNECT_ATTEMPT_INTERVAL):
             try:
                 self.mqtt_client.connect(self.mqtt_host, self.mqtt_port, MQTT_DEFAULT_TIMEOUT)
                 self._last_reconnect_attempt = self.last_data_activity
             except: pass
 
-    # ### HELPER: Extraer timestamp del mensaje si existe, sino usar el actual
+    # ### HELPER: Extract timestamp from message if it exists, otherwise use current time
     def get_msg_time(self, msg):
         if hasattr(msg, 'header'):
-            # Convertir stamp (sec, nanosec) a float seconds
+            # Convert stamp (sec, nanosec) to float seconds
             return float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
         else:
-            # Para mensajes sin header (String, Float32), usamos el tiempo de recepción
+            # For messages without header (String, Float32), we use the reception time
             return self.get_clock().now().to_msg().sec
 
     # ================= Callbacks =================
@@ -203,7 +228,8 @@ class Ros2MqttPublisher(Node):
                     "ndvi": v[0], "ndvi3d": v[1], "ndvi_ir": v[2], "ndvi_visible": v[3]
                 }
                 self.ensure_mqtt_connected()
-        except: pass
+        except Exception as e:
+            self.get_logger().error(f"Error in ndvi_callback: {e}")
 
     def area_callback(self, msg: Float32):
         self.latest_data["area"] = {"msg_type": "area", "ts": self.get_msg_time(msg), "area": msg.data}
@@ -254,94 +280,201 @@ class Ros2MqttPublisher(Node):
         self.ensure_mqtt_connected()
 
     def geometric_measurements_callback(self, msg: String):
-        """Receive per-plant JSON from area_segmentation_node and store for MQTT publication."""
+        """Receive per-plant JSON from area_segmentation_node.
+
+        Stores data locally AND immediately fires a single MQTT upload
+        containing the full sensor snapshot at this exact FOV instant.
+        """
         try:
             data = json.loads(msg.data)
-            # Enrich with timestamp and ensure msg_type is present
             data["msg_type"] = "geometric_measurements"
             data["ts"] = self.get_msg_time(msg)
             self.latest_data["geometric_measurements"] = data
             self.ensure_mqtt_connected()
+            # ── FOV event: upload now ──────────────────────────────────
+            self.publish_fov_snapshot()
         except Exception as e:
             self.get_logger().error(f"Error in geometric_measurements_callback: {e}")
 
+    def publish_fov_snapshot(self):
+        """Build and send ONE MQTT message per FOV event.
+
+        The message contains:
+        - geometric_measurements  : the per-plant analysis (primary data)
+        - snapshot of all other   : GPS, heading, NDVI, temperatures, etc.
+          sensors at this instant   (last-known values from the buffer)
+        - fov_event: True         : sentinel so the bridge server knows to
+                                    write a DB record.
+        """
+        if not self.is_connected:
+            self.get_logger().warn("FOV event: MQTT not connected — snapshot NOT sent.")
+            return
+
+        gm = self.latest_data.get("geometric_measurements")
+        if gm is None:
+            return  # nothing to publish
+
+        now_ts = self.get_clock().now().to_msg()
+        current_ts = now_ts.sec + now_ts.nanosec * 1e-9
+
+        # ── GPS snapshot ──────────────────────────────────────────────
+        gps = self.latest_data.get("gps") or {}
+
+        # ── Heading snapshot ─────────────────────────────────────────
+        heading = self.latest_data.get("heading") or {}
+
+        # ── NDVI snapshot ────────────────────────────────────────────
+        ndvi = self.latest_data.get("ndvi") or {}
+
+        # ── Area (legacy scalar) ─────────────────────────────────────
+        area = self.latest_data.get("area") or {}
+
+        # ── Canopy temperature snapshot ───────────────────────────────
+        temp = self.latest_data.get("temperature") or {}
+
+        # ── Location snapshot ─────────────────────────────────────────
+        location = self.latest_data.get("location") or {}
+
+        # ── Biomass snapshot ─────────────────────────────────────────
+        biomass = self.latest_data.get("biomass") or {}
+
+        # ── Crop meta ────────────────────────────────────────────────
+        light_state = self.latest_data.get("light_state") or {}
+        crop_type   = self.latest_data.get("crop_type")   or {}
+
+        # ── Environmental sensors ─────────────────────────────────────
+        amb_temp  = self.latest_data.get("ambient_temperature") or {}
+        rel_hum   = self.latest_data.get("relative_humidity")   or {}
+        abs_hum   = self.latest_data.get("absolute_humidity")   or {}
+        dew_point = self.latest_data.get("dew_point")           or {}
+
+        # ── UTM/TF position ───────────────────────────────────────────
+        tf = self.latest_data.get("tf_position") or {}
+
+        snapshot = {
+            # Sentinel — bridge server reacts only to this flag
+            "fov_event":    True,
+            "msg_type":     "fov_snapshot",
+            "ts":           current_ts,
+
+            # ── Primary: geometric analysis ───────────────────────────
+            "geometric_measurements": gm.get("plants", []),
+            "plant_count":            gm.get("plant_count", 0),
+
+            # ── GPS ──────────────────────────────────────────────────
+            "latitude":  gps.get("latitude"),
+            "longitude": gps.get("longitude"),
+            "altitude":  gps.get("altitude"),
+            "gps_status":  gps.get("status"),
+            "gps_service": gps.get("service"),
+
+            # ── Heading ──────────────────────────────────────────────
+            "heading_deg": heading.get("heading_deg"),
+
+            # ── NDVI ─────────────────────────────────────────────────
+            "ndvi":         ndvi.get("ndvi"),
+            "ndvi3d":       ndvi.get("ndvi3d"),
+            "ndvi_ir":      ndvi.get("ndvi_ir"),
+            "ndvi_visible": ndvi.get("ndvi_visible"),
+
+            # ── Legacy area scalar ────────────────────────────────────
+            "area_legacy": area.get("area"),
+
+            # ── Canopy temperature ────────────────────────────────────
+            "canopy_temperature_data": temp.get("plants", []),
+            "avg_canopy_temp": temp.get("avg_temp"),
+            "avg_cwsi":        temp.get("avg_cwsi"),
+
+            # ── Location & biomass ────────────────────────────────────
+            "location":    location.get("location"),
+            "biomass":     biomass.get("biomass"),
+
+            # ── Crop meta ────────────────────────────────────────────
+            "crop_light_state": light_state.get("crop_light_state"),
+            "crop_type":        crop_type.get("crop_type"),
+
+            # ── Environmental ─────────────────────────────────────────
+            "ambient_temperature": amb_temp.get("ambient_temperature"),
+            "relative_humidity":   rel_hum.get("relative_humidity"),
+            "absolute_humidity":   abs_hum.get("absolute_humidity"),
+            "dew_point":           dew_point.get("dew_point"),
+
+            # ── UTM position ──────────────────────────────────────────
+            "utm_x": tf.get("x"),
+            "utm_y": tf.get("y"),
+            "utm_z": tf.get("z"),
+        }
+
+        payload = json.dumps(snapshot)
+        self.mqtt_client.publish(MQTT_GLOBAL_TOPIC, payload, qos=0)
+        self.get_logger().info(
+            f"[FOV] Snapshot published — {gm.get('plant_count', 0)} plant(s) | "
+            f"lat={gps.get('latitude'):.6f} lon={gps.get('longitude'):.6f}"
+            if gps.get("latitude") is not None
+            else f"[FOV] Snapshot published — {gm.get('plant_count', 0)} plant(s) | GPS not available"
+        )
+
     def publish_cycle(self):
-            # 1. Get current time for the CSV row
-            now = self.get_clock().now().to_msg()
-            current_wall_time = now.sec + (now.nanosec * 1e-9)
-            
-            # --- CSV LOGIC (Independent of MQTT) ---
-            # Initialize row with last known data from our buffer
-            csv_row = {k: "" for k in self.csv_fields}
-            csv_row["ts"] = current_wall_time
+        """CSV-only timer callback (2 Hz).
 
-            # Map current buffer state to CSV
-            # GPS
-            gps = self.latest_data.get("gps")
-            if gps:
-                csv_row.update({
-                    "gps_lat": gps.get("latitude"), "gps_lon": gps.get("longitude"),
-                    "gps_alt": gps.get("altitude"), "gps_status": gps.get("status"),
-                    "gps_service": gps.get("service")
-                })
+        Writes the latest known values for all sensors to CSV.
+        MQTT is NOT published here — it is triggered event-driven in
+        publish_fov_snapshot() whenever a new geometric_measurements
+        message arrives.
+        """
+        now = self.get_clock().now().to_msg()
+        current_wall_time = now.sec + (now.nanosec * 1e-9)
 
-            # Temperature (Canopy)
-            temp = self.latest_data.get("temperature")
-            if temp:
-                csv_row["temperature_canopy"] = round(temp.get("avg_temp", 0), 2)
-                csv_row["temperature_cwsi"] = round(temp.get("avg_cwsi", 0), 2)
+        csv_row = {k: "" for k in self.csv_fields}
+        csv_row["ts"] = current_wall_time
 
-            # NDVI
-            ndvi = self.latest_data.get("ndvi")
-            if ndvi:
-                csv_row.update({
-                    "ndvi": ndvi.get("ndvi"), "ndvi3d": ndvi.get("ndvi3d"),
-                    "ndvi_ir": ndvi.get("ndvi_ir"), "ndvi_visible": ndvi.get("ndvi_visible")
-                })
+        # GPS
+        gps = self.latest_data.get("gps")
+        if gps:
+            csv_row.update({
+                "gps_lat": gps.get("latitude"), "gps_lon": gps.get("longitude"),
+                "gps_alt": gps.get("altitude"), "gps_status": gps.get("status"),
+                "gps_service": gps.get("service")
+            })
 
-            # Simple Fields
-            if self.latest_data.get("heading"): csv_row["heading_deg"] = self.latest_data["heading"].get("heading_deg")
-            if self.latest_data.get("area"): csv_row["area"] = self.latest_data["area"].get("area")
-            if self.latest_data.get("location"): csv_row["location"] = self.latest_data["location"].get("location")
-            if self.latest_data.get("biomass"): csv_row["biomass"] = self.latest_data["biomass"].get("biomass")
-            if self.latest_data.get("light_state"): csv_row["crop_light_state"] = self.latest_data["light_state"].get("crop_light_state")
-            if self.latest_data.get("crop_type"): csv_row["crop_type"] = self.latest_data["crop_type"].get("crop_type")
-            if self.latest_data.get("ambient_temperature"): csv_row["ambient_temperature"] = self.latest_data["ambient_temperature"].get("ambient_temperature")
-            if self.latest_data.get("relative_humidity"): csv_row["relative_humidity"] = self.latest_data["relative_humidity"].get("relative_humidity")
-            if self.latest_data.get("absolute_humidity"): csv_row["absolute_humidity"] = self.latest_data["absolute_humidity"].get("absolute_humidity")
-            if self.latest_data.get("dew_point"): csv_row["dew_point"] = self.latest_data["dew_point"].get("dew_point")
-            
-            # TF Position
-            tf = self.latest_data.get("tf_position")
-            if tf:
-                csv_row["tf_utm_baselink_X"] = tf.get("x")
-                csv_row["tf_utm_baselink_Y"] = tf.get("y")
+        # Temperature (Canopy)
+        temp = self.latest_data.get("temperature")
+        if temp:
+            csv_row["temperature_canopy"] = round(temp.get("avg_temp", 0), 2)
+            csv_row["temperature_cwsi"] = round(temp.get("avg_cwsi", 0), 2)
 
-            # ALWAYS write to CSV (2 times per second)
-            try:
-                with open(self.csv_file, "a", newline="") as f:
-                    writer = csv.DictWriter(f, fieldnames=self.csv_fields)
-                    writer.writerow(csv_row)
-            except Exception as e:
-                self.get_logger().error(f"CSV Write Error: {e}")
+        # NDVI
+        ndvi = self.latest_data.get("ndvi")
+        if ndvi:
+            csv_row.update({
+                "ndvi": ndvi.get("ndvi"), "ndvi3d": ndvi.get("ndvi3d"),
+                "ndvi_ir": ndvi.get("ndvi_ir"), "ndvi_visible": ndvi.get("ndvi_visible")
+            })
 
-            # --- MQTT LOGIC (Kept separate/Untouched behavior) ---
-            # We only publish via MQTT if there is actually data in the buffers
-            published_any = False
-            if self.is_connected:
-                for key, data in self.latest_data.items():
-                    if data is not None:
-                        payload = json.dumps(data)
-                        self.mqtt_client.publish(MQTT_GLOBAL_TOPIC, payload, qos=0)
-                        published_any = True
-                        
-            if published_any:
-                self._publish_log_counter += 1
-                if self._publish_log_counter % 10 == 0:
-                    self.get_logger().info("Actively publishing data to MQTT broker...")
-                
-            # IMPORTANT: We no longer set latest_data[key] = None
-            # This keeps the CSV full even if a topic doesn't send a message in a specific 0.5s window.
+        # Simple fields
+        if self.latest_data.get("heading"): csv_row["heading_deg"] = self.latest_data["heading"].get("heading_deg")
+        if self.latest_data.get("area"): csv_row["area"] = self.latest_data["area"].get("area")
+        if self.latest_data.get("location"): csv_row["location"] = self.latest_data["location"].get("location")
+        if self.latest_data.get("biomass"): csv_row["biomass"] = self.latest_data["biomass"].get("biomass")
+        if self.latest_data.get("light_state"): csv_row["crop_light_state"] = self.latest_data["light_state"].get("crop_light_state")
+        if self.latest_data.get("crop_type"): csv_row["crop_type"] = self.latest_data["crop_type"].get("crop_type")
+        if self.latest_data.get("ambient_temperature"): csv_row["ambient_temperature"] = self.latest_data["ambient_temperature"].get("ambient_temperature")
+        if self.latest_data.get("relative_humidity"): csv_row["relative_humidity"] = self.latest_data["relative_humidity"].get("relative_humidity")
+        if self.latest_data.get("absolute_humidity"): csv_row["absolute_humidity"] = self.latest_data["absolute_humidity"].get("absolute_humidity")
+        if self.latest_data.get("dew_point"): csv_row["dew_point"] = self.latest_data["dew_point"].get("dew_point")
+
+        # TF Position
+        tf = self.latest_data.get("tf_position")
+        if tf:
+            csv_row["tf_utm_baselink_X"] = tf.get("x")
+            csv_row["tf_utm_baselink_Y"] = tf.get("y")
+
+        try:
+            with open(self.csv_file, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=self.csv_fields)
+                writer.writerow(csv_row)
+        except Exception as e:
+            self.get_logger().error(f"CSV Write Error: {e}")
 
 def main(args=None):
     rclpy.init(args=args)

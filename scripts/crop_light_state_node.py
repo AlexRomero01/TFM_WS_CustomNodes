@@ -1,3 +1,22 @@
+#!/usr/bin/env python3
+"""
+crop_light_state_node.py
+=========================
+ROS 2 node that classifies whether the camera is currently viewing a
+sun-exposed or shaded crop area based on the brightness histogram of
+the incoming RGB frame.
+
+Classification rule:
+  If the fraction of pixels above `bright_pixel_threshold` intensity
+  exceeds `bright_fraction_threshold`, the state is "sun"; otherwise
+  "shade".
+
+Subscriptions:
+    /camera/camera/color/image_raw   sensor_msgs/Image  (bgr8)
+
+Publications:
+    crop_light_state   std_msgs/String   ("sun" | "shade")
+"""
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
